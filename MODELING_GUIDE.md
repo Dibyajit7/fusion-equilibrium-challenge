@@ -332,9 +332,10 @@ clipping — that means the model is worse than predicting the mean, and it scor
 points on the ψ-derived quantities — only `q95` and `βN` are predicted as values (they need
 `F(ψ)`/`p(ψ)`, which the flux map cannot contain). The training labels (`efit_li`,
 `efit_r_axis`, …, `magnetics_dsep`) remain useful as *auxiliary supervision* to shape your ψ
-decoder, but at scoring time everything geometric is read off your submitted flux map. Shape
-scalars and `dsep` are scored on diverted frames only, where their ground-truth derivation is
-well-posed; a perfect ψ scores `Consistency = 1` by construction.
+decoder, but at scoring time everything geometric is read off your submitted flux map. `dsep` is
+**not scored at all** — it is context only, and the two machines' columns are different physical
+quantities. The corpus is diverted-only, so every scored frame has a well-posed derivation; a
+perfect ψ scores `Consistency = 1` by construction.
 
 **Diagnostic metrics (not the score).** The baselines in `experiments.py` also print **MSE / MAE /
 SSIM** on the flux map. These are quick intuition proxies — SSIM in particular tells you whether the

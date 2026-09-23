@@ -345,7 +345,7 @@ z=zipfile.ZipFile('submission.zip','w'); \
 
 ## 6. Upload to Codabench
 
-1. Register at **[codabench.org/competitions/17456](https://www.codabench.org/competitions/17456/)**.
+1. Register at **[codabench.org/competitions/17739](https://www.codabench.org/competitions/17739/)**.
 2. **Submit** tab → upload `submission_pointer.zip`.
 3. Your score appears on the leaderboard in a few minutes. Open **Detailed Results** for the
    per-term breakdown, the per-scalar Consistency `R²`, and your derivation-failure rate.
@@ -652,9 +652,10 @@ as a filament. MAST's are structurally 0.0 — IMAS rectangles carry no skew.
 > and 0° denote the same unskewed coil — we ship the canonical `0`. MAST's zeros mean exactly what
 > the 13 DIII-D zeros mean, so one code path covers both machines.
 
-Every DIII-D F-coil row (R, Z, width, height, turns) matches EFIT's own `mhdin.dat` machine file
-exactly — and those turn counts (58 or 55) are now folded into `magnetics_F*`, which therefore
-carries **total ampere-turns per rectangle**, the quantity a Green's-function calculation wants.
+Every DIII-D F-coil rectangle (R, Z, width, height) matches EFIT's own `mhdin.dat` machine file
+exactly — and that file's turn counts (58 or 55) are already folded into `magnetics_F*`, which
+therefore carries **total ampere-turns per rectangle**, the quantity a Green's-function
+calculation wants. No turn count ships as a column, and none is needed.
 `ECOILA` is the exception: EFIT models that group as 48 single-turn elements over the same
 envelope and `ECOILB` is a second co-located group not shipped here, so its turn convention is
 ambiguous. `magnetics_ECOILA` is in **kA**, not kA·turn — don't apply an ampere-turn multiplier.
@@ -677,9 +678,10 @@ MAST's Thomson is a *horizontal midplane* laser: per-channel R (same values as
 `thomson_core_R` / `thomson_edge_spatial`) with `thomson_chord_Z = 0`. That zero is not a
 placeholder — FAIR level-2 exposes only `thomson_scattering.channel[:].position.r`.
 
-A worked use: build each coil's vacuum Green's function from `coil_R/Z/turns` and you get the
-coil-driven part of ψ analytically rather than learning it. Fitting ψ outside the plasma envelope
-to those Green's functions, with the shipped currents and turn counts, reaches R² ≈ 0.94.
+A worked use: build each coil's vacuum Green's function from the shipped rectangle
+(`coil_R`, `coil_Z`, `coil_width`, `coil_height`) and you get the coil-driven part of ψ
+analytically rather than learning it. Fitting ψ outside the plasma envelope to those Green's
+functions, driven by the shipped ampere-turn currents, reaches R² ≈ 0.94.
 
 ---
 
@@ -757,7 +759,7 @@ scalars) are not distributed. The three MAST demo shots in `parquet_data/` do in
 
 > **⚠️ MAST magnetics come in two time-base populations, and one of them has gaps.**
 >
-> - **1,092 of 1,206 test shots** (shot numbers above ~23,750): `magnetics_time` is `(30000,)`,
+> - **1,092 of 1,206 test shots** (the later campaigns): `magnetics_time` is `(30000,)`,
 >   a uniform 0.2 ms / 5 kHz grid spanning −2,000 → +3,999.8 ms, every column finite.
 > - **114 shots** (the early campaign): `magnetics_time` is `(15482,)` spanning −2,500 → +5,499
 >   ms and is the **union of two acquisition grids** — the poloidal set (P-coils, Ip, solenoid,
@@ -806,20 +808,24 @@ scalars) are not distributed. The three MAST demo shots in `parquet_data/` do in
   - **The official scorer is sign-invariant**: it determines the global sign of your submitted
     flux map per machine, scores you under it, and reports which sign it used. You are not being
     tested on guessing a storage convention. Amplitude is *not* normalized.
-- **⚠️ Current units differ between the machines — and not by a single factor.** Confirmed
-  against FAIR-MAST's own metadata and cross-checked against its IMAS level-2 store (SI, amperes):
+- **⚠️ Current units, harmonized across both machines in v1.1.0.** Shaping-coil currents are
+  already in **ampere-turns**, so the two machines are directly comparable and **there is no
+  `coil_turns` column — you do not need one, and you must not apply a turn multiplier**:
 
-  | Columns | Units as shipped | To amperes-per-turn (DIII-D's convention) |
-  | :--- | :--- | :--- |
-  | DIII-D `magnetics_F*`, `ECOILA`, `bcoil`, `plasma_current` | **A** | already A |
-  | MAST `magnetics_plasma_current`, `_tf_current`, `_sol_current`, `_efps_current` | **kA** | `× 1000` |
-  | MAST `magnetics_p{2-6}{l,u}_current` | **kA·turn** | `× 1000 / turns` |
+  | Columns | Units as shipped |
+  | :--- | :--- |
+  | DIII-D `magnetics_F1A`–`F9B` | **kA·turn** (each coil's 58 or 55 turns already folded in) |
+  | MAST `magnetics_p{2-6}{l,u}_current` | **kA·turn** (natively) |
+  | `magnetics_plasma_current` (both machines) | **kA** |
+  | DIII-D `magnetics_ECOILA`, `magnetics_bcoil` | **kA** |
+  | MAST `magnetics_sol_current`, `_tf_current`, `_efps_current` | **kA** |
 
-  The ten MAST P-coil columns are **ampere-turns** — upstream labels them `kA * turn` — which is
-  a different quantity from a coil current. Turn counts come from this dataset's own `coil_*`
-  geometry columns (elements per coil): **P2 = 20**, **P3 = 8**, **P4 = 23**, **P5 = 23**,
-  **P6 = 4**. A naive "×1000" therefore fixes Ip/TF/solenoid/EFPS but leaves every P-coil wrong
-  by 8–23×. Normalizing per machine (recommended) absorbs all of it.
+  So `F4A` and MAST `p4u` are the same kind of quantity — that is what a Green's-function
+  calculation wants. The four kA channels stay in plain kA because no trustworthy turn count
+  exists for them: `ECOILA`'s turn convention is genuinely ambiguous (EFIT models the group as 48
+  single-turn elements, and `ECOILB` is a co-located group not shipped here), and `bcoil`/`tf` are
+  toroidal field coils. Normalizing per machine (recommended) is still the simplest way to handle
+  the remaining scale spread.
 - **Time units are ms everywhere**, including MAST (`magnetics_time`, `efit_times`, `magnetics_dsep_times`). MAST upstream stores some signals in seconds; the conversion is applied at parquet build time so participants don't have to think about it.
 - **Magnetics time base is shared per machine**: both DIII-D and MAST expose one `magnetics_time` array used by every coil signal at the primary sampling rate. On DIII-D, `magnetics_plasma_current` (Ip) sits on its own ADC at a different rate and therefore has its own `magnetics_plasma_current_times` companion — **⚠️ which shipped wrong on ~69% of shots; use `data_fixes.fix_d3d_ip_times` (see [Data errata](#data-errata-v110))**. On MAST, 114 early-campaign shots use a two-grid union base with per-column nulls — see the MAST magnetics note above.
 - `dsep` **is on the EFIT time base**: `magnetics_dsep_times` is identical to `efit_times` on every shot for both machines. It's grouped under `magnetics_`* only for column-naming consistency; physically it's an EFIT-derived geometric quantity, not a magnetic measurement.
