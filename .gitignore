@@ -10,3 +10,4 @@ sample_submission/
 # Submitted on purpose, but never committed.
 submission_pointer.zip
 manifest.json
+hf_local_data/
