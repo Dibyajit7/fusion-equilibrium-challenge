@@ -167,6 +167,31 @@ zero-shot transfer** at a small in-domain cost (0.819 vs 0.852 SSIM).
   Worth resolving before this becomes a submission, since the official
   score weights `R²ψ` at 0.55 — the single largest term.
 
+**Re-run at 640 shots (4.3x the data) — the finding got sharper, not just
+bigger:**
+
+| Approach | DIII-D SSIM | MAST SSIM (zero-shot) | Transfer ratio |
+|---|---|---|---|
+| RAW coils (naive) | 0.852 → **0.947** | 0.056 → **−0.021** | 0.066 → **−0.022** |
+| PHYSICS features | 0.819 → 0.718 | 0.237 → 0.216 | 0.289 → 0.301 |
+
+The naive model's DIII-D fit got better with more data (as expected) while
+its MAST transfer flipped net-negative — more data let it fit DIII-D's
+specific coil wiring more precisely, which has zero shared structure with
+MAST's different coil layout, so a tighter DIII-D fit actively makes
+cross-machine transfer *worse*, not just fail to help. This is a stronger
+version of the paper's warning than the 150-shot run showed.
+
+The physics-feature model's transfer ratio held steady (0.289→0.301) while
+its own in-domain SSIM dropped (0.819→0.718) as shot diversity grew 4.3x.
+Reading that as the 7-feature set being **capacity-limited, not
+overfitting**: a handful of scalar physics summaries can't represent 640
+shots' worth of flux-shape diversity, regardless of how much data backs
+them. The lever to pull next is a richer machine-agnostic feature set
+(geometric asymmetry via coil R/Z positions, more Thomson profile shape
+descriptors) or more model capacity — not more data, which is already not
+the bottleneck here.
+
 ---
 
 ## Where this leaves the project
