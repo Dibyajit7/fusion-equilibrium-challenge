@@ -92,8 +92,11 @@ def _thomson_pressure_stats(row: dict, target_times: np.ndarray) -> np.ndarray:
     unlike raw per-coil currents."""
     try:
         times = np.asarray(row["thomson_core_times"], dtype=np.float64)
-        Te = np.asarray(row["thomson_core_Te"], dtype=np.float32)
-        ne = np.asarray(row["thomson_core_ne"], dtype=np.float32)
+        # float64: ne ~1e19-1e20 m^-3 times Te ~1e2-1e4 eV gives pe ~1e21-1e24,
+        # and nanstd squares internally -- pe**2 overflows float32 (max ~3.4e38)
+        # but not float64 (max ~1.8e308).
+        Te = np.asarray(row["thomson_core_Te"], dtype=np.float64)
+        ne = np.asarray(row["thomson_core_ne"], dtype=np.float64)
     except Exception:
         return np.zeros((len(target_times), 4), dtype=np.float32)
 

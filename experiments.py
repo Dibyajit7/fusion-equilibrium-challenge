@@ -149,6 +149,24 @@ def _as_psirz_stack(psirz_raw) -> np.ndarray:
     )
 
 
+def _as_profile_stack(raw) -> np.ndarray:
+    """Normalize a (T, n_channels) Thomson profile to a clean float32 ndarray.
+
+    Same failure mode _as_psirz_stack exists to handle, one level down: a
+    numpy object-array of per-timestep arrays (what pandas/pyarrow hands back
+    from a locally downloaded parquet file) fails a direct
+    ``np.asarray(raw, dtype=float)`` cast with 'setting an array element with
+    a sequence' EVEN WHEN every element has the identical shape -- a numpy
+    casting quirk, not a real raggedness. ``np.stack`` on the unpacked list
+    works where ``np.asarray`` on the still-wrapped object-array does not.
+    HF-streamed rows hand back an already-clean array, so this is a no-op there.
+    """
+    arr = np.asarray(raw)
+    if arr.dtype == object:
+        return np.stack([np.asarray(p, dtype=np.float32) for p in raw])
+    return arr.astype(np.float32)
+
+
 def load_shot_from_hf_row(row: dict) -> dict:
     """Convert one Hugging Face dataset row into the internal shot dict."""
     shot: dict = {"source": row.get("source", "DIII-D")}
@@ -177,8 +195,8 @@ def load_shot_from_hf_row(row: dict) -> dict:
         try:
             shot["thomson_core"] = {
                 "times": np.asarray(row["thomson_core_times"], dtype=np.float64),
-                "Te": np.asarray(row["thomson_core_Te"], dtype=np.float32),
-                "ne": np.asarray(row["thomson_core_ne"], dtype=np.float32),
+                "Te": _as_profile_stack(row["thomson_core_Te"]),
+                "ne": _as_profile_stack(row["thomson_core_ne"]),
             }
         except Exception:
             pass
@@ -187,8 +205,8 @@ def load_shot_from_hf_row(row: dict) -> dict:
         try:
             shot["thomson_edge"] = {
                 "times": np.asarray(row["thomson_edge_times"], dtype=np.float64),
-                "Te": np.asarray(row["thomson_edge_Te"], dtype=np.float32),
-                "ne": np.asarray(row["thomson_edge_ne"], dtype=np.float32),
+                "Te": _as_profile_stack(row["thomson_edge_Te"]),
+                "ne": _as_profile_stack(row["thomson_edge_ne"]),
             }
         except Exception:
             pass

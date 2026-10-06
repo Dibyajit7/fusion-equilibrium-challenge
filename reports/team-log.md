@@ -194,6 +194,75 @@ the bottleneck here.
 
 ---
 
+---
+
+## 6. Submission-building role
+
+**Task:** turn the trained models into an actual `submission_skeleton.py`
+that produces format-valid predictions for both test configs.
+
+**Hurdle, the most subtle one yet:** the dry-run crashed with a feature-count
+mismatch (129 vs 21). Tracing it back: `--include-thomson` had been silently
+doing nothing in **every local-data run so far**, including the 640-shot
+baseline reported above (R²=0.995/SSIM=0.997) — those numbers used raw coil
+currents only, despite us believing Thomson scattering was included.
+
+The cause, layer by layer:
+1. Thomson arrays loaded from a *locally downloaded* parquet file arrive as a
+   numpy object-array of per-timestep arrays. `np.asarray(that, dtype=float)`
+   raises `ValueError: setting an array element with a sequence` **even when
+   every element has the identical shape** — a numpy casting quirk, not real
+   raggedness (confirmed: all 44 channels, every timestep, for the shot
+   tested). This is the exact failure mode `_as_psirz_stack` already existed
+   to handle for the flux-map target, just never applied one level down to
+   Thomson. The starter kit's loader wraps this in a bare `except
+   Exception: pass`, so the column was silently dropped rather than erroring
+   — correct defensive design in general, but it hid a real bug here.
+2. **Fixed properly** (not worked around): added `_as_profile_stack()` to
+   `experiments.py`, the same fix pattern as `_as_psirz_stack`, and used it
+   in both the vendored loader and our own inference code.
+3. Fixing #1 exposed a second, *real* issue underneath: core Thomson channel
+   count genuinely varies shot-to-shot (44 channels on most shots, but 42 or
+   54 on others — real hardware/config differences, confirmed across 30
+   shots). Raw per-channel feature expansion can't produce one fixed-width
+   feature matrix across shots with different channel counts.
+
+**Decision, not a fix:** rather than pad/truncate channels (which would mix
+up spatial meaning across differently-configured shots) or redesign the
+DIII-D pipeline around aggregate Thomson statistics late in the process, we
+descoped Thomson from the DIII-D pipeline for this submission and kept the
+already-validated raw-coil-only model (R²=0.995, SSIM=0.997 — those numbers
+are accurate; they just never had Thomson in them to begin with). The MAST
+physics-feature pipeline was never affected by either issue, since it was
+built around aggregate statistics (peak/integrated/mean/std of electron
+pressure) from the start rather than raw per-channel expansion — the same
+design choice that made it machine-agnostic also made it immune to this bug.
+
+**Open lead, not pursued further here:** redesigning the DIII-D pipeline to
+use aggregate Thomson statistics (matching the MAST pipeline's approach)
+instead of raw per-channel values would sidestep the variable-channel-count
+problem entirely and might meaningfully improve `q95`/`li` prediction, since
+those scalars are physically tied to pressure-profile information that raw
+coil currents don't carry. Worth doing before a final competitive submission,
+not required for a format-valid one.
+
+**A second numerical bug, caught by the dry run itself:** the first
+`submission_skeleton.py --max-shots 5` attempt (after fixing the above)
+produced `RuntimeWarning: overflow encountered in multiply` from inside
+`np.nanstd`. Cause: `pe = Te * ne` (electron pressure, used in the MAST
+physics features) reaches ~10²¹–10²⁴ in SI units, and `nanstd` squares
+internally — that overflows float32 (max ~3.4×10³⁸ is closer than it looks
+once you're squaring 10²³) but not float64. Fixed by computing `Te`/`ne`/`pe`
+in float64 inside `_thomson_pressure_stats`, then retrained the MAST
+physics pipeline from scratch to make sure the saved model wasn't fit on
+any silently-corrupted (inf/overflowed) feature values. The earlier
+cross-machine transfer numbers reported above were checked against this —
+neither the 150-shot nor 640-shot experiment logs show this warning, so
+those results stand uncorrected; it only surfaced once the submission dry
+run streamed different (and apparently more extreme) test shots.
+
+---
+
 ## Where this leaves the project
 
 The infra hurdles (streaming flakiness, the MAST row-parsing bug) are
