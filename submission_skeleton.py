@@ -172,7 +172,15 @@ def your_model_predict(row: dict, source: str) -> dict:
 
 
 def build_submission(config: str, split: str, out_dir: Path, max_shots: int) -> Path:
-    ds = load_dataset(REPO_ID, config, split=split, streaming=True)
+    # streaming=False: downloads via the datasets library's own robust cache
+    # (parallel whole-shard downloads, resumable) instead of one HTTP range
+    # request per row -- much faster on a flaky connection, and critically,
+    # still yields rows in the Hub's canonical order. Submission shot_XXXX
+    # indices must match "test-stream order" per the README; a naive re-read
+    # from our own manually-downloaded hf_local_data/ files (grabbed in no
+    # particular order via hf_hub_download) would silently corrupt the
+    # shot-to-ground-truth correspondence despite passing shape validation.
+    ds = load_dataset(REPO_ID, config, split=split, streaming=False)
     preds: dict[str, np.ndarray] = {}
     n = 0
     for i, row in enumerate(ds):
