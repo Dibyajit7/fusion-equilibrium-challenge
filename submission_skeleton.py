@@ -79,6 +79,30 @@ from experiments import (  # noqa: E402
 )
 from cross_machine_physics_features import build_physics_features  # noqa: E402
 
+# Optional PyTorch conv-decoder for DIII-D psi (see scripts/torch_models.py and
+# scripts/train_torch_d3d.py). Used in place of d3d_pca/d3d_psi_model when its
+# artifacts are present and it has been validated to beat the sklearn baseline
+# on scripts/leak_safe_score.py -- otherwise falls back to the sklearn path so
+# this script keeps working if torch isn't installed or hasn't been trained yet.
+try:
+    import torch
+    from torch_models import FluxDecoderNet, resolve_device
+    _D3D_TORCH_CKPT = Path(__file__).resolve().parent / "models" / "d3d_torch_model.pt"
+    _TORCH_OK = _D3D_TORCH_CKPT.exists()
+except ImportError:
+    _TORCH_OK = False
+
+# D3D_PSI_MODE picks which model produces the DIII-D psi prediction:
+#   "sklearn"  (default) -- StandardScaler -> PCA(50) -> MLPRegressor, the original baseline.
+#   "torch"    -- the conv-decoder (scripts/train_torch_d3d.py), direct pixel regression.
+#   "ensemble" -- mean of both psirz predictions.
+# Opt-in via env var so the default submission path is untouched until a run has
+# actually been validated (scripts/leak_safe_score.py) to beat the baseline.
+D3D_PSI_MODE = os.environ.get("D3D_PSI_MODE", "sklearn")
+if D3D_PSI_MODE in ("torch", "ensemble") and not _TORCH_OK:
+    raise RuntimeError(f"D3D_PSI_MODE={D3D_PSI_MODE!r} needs models/d3d_torch_model.pt "
+                        "(run scripts/train_torch_d3d.py first) and torch installed.")
+
 
 def _build_input_shot(row: dict) -> dict:
     """Like experiments.load_shot_from_hf_row, but for inputs only -- test-split
@@ -121,6 +145,15 @@ def _load_models() -> dict:
                       "physics_scaler", "physics_pca", "physics_psi_model",
                       "physics_q95_model", "physics_betan_model", "mast_calibration"]:
             _models[name] = joblib.load(MODELS_DIR / f"{name}.joblib")
+        if D3D_PSI_MODE in ("torch", "ensemble"):
+            _models["d3d_torch_scaler"] = joblib.load(MODELS_DIR / "d3d_torch_scaler.joblib")
+            ckpt = torch.load(_D3D_TORCH_CKPT, map_location="cpu", weights_only=True)
+            device = resolve_device()
+            net = FluxDecoderNet(n_features=ckpt["n_features"], base=ckpt["base"])
+            net.load_state_dict(ckpt["state_dict"])
+            net.eval().to(device)
+            _models["d3d_torch_model"] = net
+            _models["d3d_torch_device"] = device
     return _models
 
 
@@ -133,9 +166,26 @@ def _predict_d3d(row: dict) -> dict:
     X = interpolate_magnetics_to_efit(shot)
     X_scaled = m["d3d_scaler"].transform(X)
 
-    psirz = m["d3d_pca"].inverse_transform(m["d3d_psi_model"].predict(X_scaled))
+    # q95/betaN are unaffected by which psi model is in use -- always the sklearn scalar heads.
     q95 = m["d3d_q95_model"].predict(X_scaled).astype(np.float32)
     betaN = m["d3d_betan_model"].predict(X_scaled).astype(np.float32)
+
+    psirz_sklearn = None
+    psirz_torch = None
+    if D3D_PSI_MODE in ("sklearn", "ensemble"):
+        psirz_sklearn = m["d3d_pca"].inverse_transform(m["d3d_psi_model"].predict(X_scaled))
+    if D3D_PSI_MODE in ("torch", "ensemble"):
+        X_torch_scaled = m["d3d_torch_scaler"].transform(X).astype(np.float32)
+        device = m["d3d_torch_device"]
+        with torch.no_grad():
+            x_t = torch.from_numpy(X_torch_scaled).to(device)
+            psirz_torch = m["d3d_torch_model"](x_t).cpu().numpy().astype(np.float32)
+
+    if D3D_PSI_MODE == "ensemble":
+        psirz = ((psirz_sklearn.astype(np.float32) + psirz_torch) / 2.0).astype(np.float32)
+    else:
+        psirz = psirz_torch if D3D_PSI_MODE == "torch" else psirz_sklearn
+
     return {"psirz": psirz, "q95": q95, "betaN": betaN}
 
 

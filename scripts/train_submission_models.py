@@ -27,7 +27,9 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import sys
+import time
 from pathlib import Path
 
 import joblib
@@ -41,6 +43,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from experiments import (  # noqa: E402
+    D3D_MAGNETICS_SIGNALS,
     EFIT_SCALAR_LABELS,
     TargetPCA,
     build_feature_matrix,
@@ -60,6 +63,23 @@ MODELS_DIR.mkdir(exist_ok=True)
 Q95_IDX = EFIT_SCALAR_LABELS.index("efit_q95")
 BETAN_IDX = EFIT_SCALAR_LABELS.index("efit_beta_n")
 
+# Lean column set for the D3D stage (raw coils + plasma current only, no
+# Thomson) -- same NEEDED_COLUMNS as scripts/train_torch_d3d.py, and for the
+# same reason: reading+holding every row's full Thomson/magnetics columns for
+# ALL shots at once (the previous approach here) caused a real jetsam OOM kill
+# once shot counts got large. Processing one lean shot at a time instead keeps
+# at most one shot's data resident, regardless of how many shots are trained on.
+D3D_NEEDED_COLUMNS = (
+    ["source", "efit_times", "efit_psirz", "magnetics_time", "magnetics_plasma_current_times"]
+    + [f"magnetics_{sig}" for sig in D3D_MAGNETICS_SIGNALS]
+    + list(EFIT_SCALAR_LABELS)
+)
+
+
+def load_shot_lean(path: Path) -> dict:
+    row = pd.read_parquet(path, columns=D3D_NEEDED_COLUMNS).iloc[0]
+    return load_shot_from_hf_row(row)
+
 
 def fit_scalar_model(X: np.ndarray, y: np.ndarray) -> MLPRegressor:
     mask = np.isfinite(y)
@@ -70,17 +90,33 @@ def fit_scalar_model(X: np.ndarray, y: np.ndarray) -> MLPRegressor:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-shots", type=int, default=0,
+                        help="cap the number of local DIII-D shots used (0 = all available)")
+    parser.add_argument("--stage", choices=["d3d", "mast", "both"], default="both",
+                        help="run only one pipeline (each saves its own artifacts and can be "
+                             "run independently, so a kill mid-run doesn't lose the other stage)")
+    args = parser.parse_args()
+
     d3d_files = sorted(D3D_LOCAL_DIR.glob("*.parquet"))
+    if args.max_shots:
+        d3d_files = d3d_files[:args.max_shots]
     print(f"Training on {len(d3d_files)} local DIII-D shots")
 
+    if args.stage in ("d3d", "both"):
+        train_d3d(d3d_files)
+    if args.stage in ("mast", "both"):
+        train_mast(d3d_files)
+
+    print("\nDone. All artifacts in models/ -- see submission_skeleton.py's "
+          "your_model_predict() for how they're loaded and used.")
+
+
+def train_d3d(d3d_files):
     # ------------------------------------------------------------------
     # DIII-D pipeline (raw coils + Thomson)
     # ------------------------------------------------------------------
     print("\n=== DIII-D pipeline ===")
-    rows = [pd.read_parquet(f).iloc[0] for f in d3d_files]
-    shots = [load_shot_from_hf_row(r) for r in rows]
-    for i, s in enumerate(shots):
-        s["shot_index"] = i
 
     # include_thomson=False: raw per-channel Thomson expansion hits a real
     # variable-channel-count issue across shots (44 vs 42 vs 54 core channels
@@ -89,7 +125,25 @@ def main():
     # reports/team-log.md for the full story and why this was descoped
     # rather than fixed with ad hoc padding. The raw-coil-only pipeline
     # below is the one already validated at R2=0.995/SSIM=0.997.
-    X, Y, S, shot_ids = build_feature_matrix(shots, include_thomson=False)
+    #
+    # One shot loaded (lean columns) at a time, immediately reduced to its
+    # small feature/target slice -- see D3D_NEEDED_COLUMNS above for why.
+    t0 = time.time()
+    X_parts, Y_parts, S_parts = [], [], []
+    for i, f in enumerate(d3d_files):
+        shot = load_shot_lean(f)
+        shot["shot_index"] = i
+        Xi, Yi, Si, _ = build_feature_matrix([shot], include_thomson=False)
+        X_parts.append(Xi)
+        Y_parts.append(Yi)
+        S_parts.append(Si)
+        del shot
+        if (i + 1) % 200 == 0:
+            print(f"  loaded {i + 1}/{len(d3d_files)} shots ({time.time() - t0:.0f}s)")
+    X = np.concatenate(X_parts)
+    Y = np.concatenate(Y_parts)
+    S = np.concatenate(S_parts)
+    del X_parts, Y_parts, S_parts
     print(f"  X: {X.shape}, Y: {Y.shape}")
 
     scaler = StandardScaler().fit(X)
@@ -114,11 +168,34 @@ def main():
     joblib.dump(betaN_model, MODELS_DIR / "d3d_betan_model.joblib")
     print(f"  Saved to {MODELS_DIR}/d3d_*.joblib")
 
+
+def train_mast(d3d_files):
     # ------------------------------------------------------------------
     # MAST pipeline (machine-agnostic physics features, trained on DIII-D)
     # ------------------------------------------------------------------
     print("\n=== MAST pipeline (physics features, zero-shot) ===")
-    Xp, Yp_raw, shot_ids_p = build_physics_dataset(rows)
+
+    # Physics features need Thomson (pressure stats), so this reads full rows
+    # -- but still one row at a time, discarded immediately after extracting
+    # its small feature/target slice, so peak memory stays at ~1 row.
+    t0 = time.time()
+    Xp_parts, Yp_parts, id_parts, scalars_list = [], [], [], []
+    for i, f in enumerate(d3d_files):
+        row = pd.read_parquet(f).iloc[0]
+        Xp_i, Yp_i, _ = build_physics_dataset([row])
+        Xp_parts.append(Xp_i)
+        Yp_parts.append(Yp_i)
+        id_parts.append(np.full(len(Xp_i), i, dtype=np.int32))
+        shot = load_shot_from_hf_row(row)
+        scalars_list.append(shot.get("scalars", {}))
+        del row, shot
+        if (i + 1) % 200 == 0:
+            print(f"  loaded {i + 1}/{len(d3d_files)} shots ({time.time() - t0:.0f}s)")
+    Xp = np.concatenate(Xp_parts)
+    Yp_raw = np.concatenate(Yp_parts)
+    shot_ids_p = np.concatenate(id_parts)
+    del Xp_parts, Yp_parts, id_parts
+    print(f"  Xp: {Xp.shape}, Yp: {Yp_raw.shape}")
     Yp_norm, _, _ = normalize_flux_per_frame(Yp_raw)
 
     physics_scaler = StandardScaler().fit(Xp)
@@ -134,9 +211,9 @@ def main():
     # (the D3D raw+Thomson scalar models above use D3D-only column names).
     S_phys = np.full((len(Xp), 2), np.nan, dtype=np.float32)
     offset = 0
-    for shot_id, shot in zip(np.unique(shot_ids_p), shots):
+    for shot_id in np.unique(shot_ids_p):
         n = int((shot_ids_p == shot_id).sum())
-        shot_scalars = shot.get("scalars", {})
+        shot_scalars = scalars_list[shot_id]
         for j, name in enumerate(["efit_q95", "efit_beta_n"]):
             arr = shot_scalars.get(name)
             if arr is not None:
@@ -170,9 +247,6 @@ def main():
     calibration = {"mast_mean": mast_mean, "mast_std": mast_std, "mast_sign": -1.0}
     joblib.dump(calibration, MODELS_DIR / "mast_calibration.joblib")
     print(f"  Saved to {MODELS_DIR}/mast_calibration.joblib")
-
-    print("\nDone. All artifacts in models/ -- see submission_skeleton.py's "
-          "your_model_predict() for how they're loaded and used.")
 
 
 if __name__ == "__main__":

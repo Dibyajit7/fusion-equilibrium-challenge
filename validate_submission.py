@@ -86,9 +86,13 @@ def validate(npz_path: Path, config: str, max_shots: int) -> int:
 
     sub = dict(np.load(npz_path, allow_pickle=False))
     print(f"Validating {npz_path.name} against {config} (expects {machine} grid {(H, W)})")
-    print(f"  {len(sub)} arrays in the .npz; streaming reference inputs from the Hub …")
+    print(f"  {len(sub)} arrays in the .npz; loading reference inputs from the Hub …")
 
-    ds = load_dataset(REPO_ID, config, split=split, streaming=True)
+    # streaming=False: same fix as build_submission() in submission_skeleton.py --
+    # streaming does one HTTP range-request per row and proved fragile on this
+    # network (repeated unrecoverable crashes); non-streaming downloads via the
+    # datasets library's own robust whole-shard cache instead.
+    ds = load_dataset(REPO_ID, config, split=split, streaming=False)
     errors: list[str] = []
     warnings: list[str] = []
     n = 0

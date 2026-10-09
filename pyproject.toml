@@ -14,6 +14,7 @@ dependencies = [
     "scikit-image>=0.22",
     "datasets>=2.14",
     "plotly>=5.18",
+    "torch>=2.5.1",
 ]
 
 [dependency-groups]
