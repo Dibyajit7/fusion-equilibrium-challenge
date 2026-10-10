@@ -326,40 +326,76 @@ def interpolate_magnetics_to_efit(shot: dict) -> np.ndarray:
     return np.column_stack(features)  # (T, 21)
 
 
+THOMSON_SYSTEMS = ["thomson_core", "thomson_edge"]
+THOMSON_MEASURES = ["Te", "ne"]
+THOMSON_STATS = ["mean", "std", "max", "min"]
+# Per system: 2 measures x 4 stats, plus peak/integrated electron pressure (pe = Te*ne).
+N_THOMSON_PER_SYSTEM = len(THOMSON_MEASURES) * len(THOMSON_STATS) + 2
+N_THOMSON_FEATURES = len(THOMSON_SYSTEMS) * N_THOMSON_PER_SYSTEM
+
+
+def _profile_stats(profiles: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-timestep mean/std/max/min of a (n_times, n_channels) profile, NaN-robust.
+    float64: ne ~1e19-1e20 m^-3 squared (nanstd's internal step) overflows float32
+    (max ~3.4e38) but not float64 -- same fix as cross_machine_physics_features.py's
+    _thomson_pressure_stats."""
+    profiles = profiles.astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        return {
+            "mean": np.nanmean(profiles, axis=1),
+            "std": np.nanstd(profiles, axis=1),
+            "max": np.nanmax(profiles, axis=1),
+            "min": np.nanmin(profiles, axis=1),
+        }
+
+
 def interpolate_thomson_to_efit(shot: dict) -> Optional[np.ndarray]:
-    """Interpolate Thomson scattering to EFIT times. Returns (T, n_channels) or None."""
+    """Shape-agnostic Thomson features interpolated to EFIT times: per-timestep
+    mean/std/max/min of Te and ne, plus peak/integrated electron pressure
+    (pe = Te*ne), for each of the core/edge systems. Returns (T, N_THOMSON_FEATURES),
+    a FIXED width regardless of how many raw Thomson channels a shot has (40/42/
+    43/44/54 for DIII-D core, 10/14 for edge) -- unlike indexing channels directly
+    by position, which breaks concatenation across shots with different channel
+    counts (the original bug -- see reports/team-log.md). DIII-D core channels
+    also have no shipped spatial coordinate (R is ~constant, Z was never shipped),
+    so a position-aligned profile isn't recoverable anyway; shape-agnostic stats
+    are the right level of fidelity here, not a workaround.
+    """
     efit_times = shot["efit_times"]
     all_features = []
 
-    for system_key in ["thomson_core", "thomson_edge"]:
-        if system_key not in shot:
+    for system_key in THOMSON_SYSTEMS:
+        system = shot.get(system_key)
+        Te = system.get("Te") if system else None
+        ne = system.get("ne") if system else None
+        if system is None or Te is None or ne is None:
+            all_features.append(np.zeros((len(efit_times), N_THOMSON_PER_SYSTEM), dtype=np.float32))
             continue
-        system = shot[system_key]
-        for measure in ["Te", "ne"]:
-            if measure not in system:
+
+        thomson_times = system["times"]
+        stat_series = {}
+        for name, measure in [("Te", Te), ("ne", ne)]:
+            for stat_name, arr in _profile_stats(measure).items():
+                stat_series[f"{name}_{stat_name}"] = arr
+        with np.errstate(invalid="ignore"):
+            pe = Te.astype(np.float64) * ne.astype(np.float64)
+            stat_series["pe_peak"] = np.nanmax(pe, axis=1)
+            stat_series["pe_integrated"] = np.nansum(np.where(np.isfinite(pe), pe, 0.0), axis=1)
+
+        system_features = []
+        for series in stat_series.values():
+            mask = np.isfinite(series)
+            if mask.sum() < 2:
+                system_features.append(np.zeros(len(efit_times), dtype=np.float32))
                 continue
-            profiles = system[measure]  # (n_thomson_times, n_channels)
-            thomson_times = system["times"]
-            n_channels = profiles.shape[1] if profiles.ndim == 2 else 1
+            f = interp1d(
+                thomson_times[mask], series[mask],
+                kind="linear", fill_value=0.0, bounds_error=False,
+            )
+            system_features.append(f(efit_times).astype(np.float32))
+        all_features.append(np.column_stack(system_features))
 
-            for ch in range(n_channels):
-                if profiles.ndim == 2:
-                    ch_data = profiles[:, ch]
-                else:
-                    ch_data = profiles
-                mask = np.isfinite(ch_data)
-                if mask.sum() < 2:
-                    all_features.append(np.zeros(len(efit_times), dtype=np.float32))
-                    continue
-                f = interp1d(
-                    thomson_times[mask], ch_data[mask],
-                    kind="linear", fill_value=0.0, bounds_error=False,
-                )
-                all_features.append(f(efit_times).astype(np.float32))
-
-    if not all_features:
-        return None
-    return np.column_stack(all_features)
+    return np.hstack(all_features)
 
 
 def build_feature_matrix(
@@ -433,13 +469,21 @@ class TargetPCA:
         self._fitted = False
 
     def fit(self, Y: np.ndarray) -> "TargetPCA":
-        Y_flat = Y.reshape(len(Y), -1).astype(np.float64)
+        # float32, not float64: fit/transform run on the FULL training set (every
+        # frame of every shot), and upcasting that whole array doubles its size --
+        # at full dataset scale (6000+ shots) that alone is tens of GB and crashes.
+        # sklearn's PCA handles float32 natively; flux values are O(1)-O(10), not
+        # pathologically scaled, so this isn't the float32-overflow situation that
+        # genuinely needed float64 elsewhere (Thomson ne ~1e19, pe ~1e23).
+        # inverse_transform below stays float64 -- it only ever runs on one shot's
+        # worth of frames at inference time, so the cost is negligible there.
+        Y_flat = Y.reshape(len(Y), -1)
         self.pca.fit(Y_flat)
         self._fitted = True
         return self
 
     def transform(self, Y: np.ndarray) -> np.ndarray:
-        Y_flat = Y.reshape(len(Y), -1).astype(np.float64)
+        Y_flat = Y.reshape(len(Y), -1)
         return self.pca.transform(Y_flat).astype(np.float32)
 
     def inverse_transform(self, coefficients: np.ndarray) -> np.ndarray:

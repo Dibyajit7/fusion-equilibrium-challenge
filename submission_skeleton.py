@@ -76,6 +76,7 @@ from experiments import (  # noqa: E402
     _as_profile_stack,
     fix_d3d_ip_times,
     interpolate_magnetics_to_efit,
+    interpolate_thomson_to_efit,
 )
 from cross_machine_physics_features import build_physics_features  # noqa: E402
 
@@ -158,12 +159,12 @@ def _load_models() -> dict:
 
 
 def _predict_d3d(row: dict) -> dict:
-    # Raw coils only, matching scripts/train_submission_models.py -- raw
-    # per-channel Thomson expansion hits a real variable-channel-count issue
-    # across shots; see reports/team-log.md.
+    # Raw coils + shape-agnostic Thomson stats, matching
+    # scripts/train_submission_models.py and scripts/train_torch_d3d.py exactly
+    # -- the scaler/models were fit on this same hstacked feature order.
     m = _load_models()
     shot = _build_input_shot(row)
-    X = interpolate_magnetics_to_efit(shot)
+    X = np.hstack([interpolate_magnetics_to_efit(shot), interpolate_thomson_to_efit(shot)])
     X_scaled = m["d3d_scaler"].transform(X)
 
     # q95/betaN are unaffected by which psi model is in use -- always the sklearn scalar heads.

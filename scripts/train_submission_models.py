@@ -63,15 +63,18 @@ MODELS_DIR.mkdir(exist_ok=True)
 Q95_IDX = EFIT_SCALAR_LABELS.index("efit_q95")
 BETAN_IDX = EFIT_SCALAR_LABELS.index("efit_beta_n")
 
-# Lean column set for the D3D stage (raw coils + plasma current only, no
-# Thomson) -- same NEEDED_COLUMNS as scripts/train_torch_d3d.py, and for the
-# same reason: reading+holding every row's full Thomson/magnetics columns for
-# ALL shots at once (the previous approach here) caused a real jetsam OOM kill
-# once shot counts got large. Processing one lean shot at a time instead keeps
-# at most one shot's data resident, regardless of how many shots are trained on.
+# Lean column set for the D3D stage -- only the columns this pipeline actually
+# reads, not every column a full-row load would pull in. Same NEEDED_COLUMNS
+# pattern as scripts/train_torch_d3d.py, and for the same reason: reading+
+# holding every row's full column set for ALL shots at once (the previous
+# approach here) caused a real jetsam OOM kill once shot counts got large.
+# Processing one lean shot at a time instead keeps at most one shot's data
+# resident, regardless of how many shots are trained on.
 D3D_NEEDED_COLUMNS = (
     ["source", "efit_times", "efit_psirz", "magnetics_time", "magnetics_plasma_current_times"]
     + [f"magnetics_{sig}" for sig in D3D_MAGNETICS_SIGNALS]
+    + ["thomson_core_times", "thomson_core_Te", "thomson_core_ne",
+       "thomson_edge_times", "thomson_edge_Te", "thomson_edge_ne"]
     + list(EFIT_SCALAR_LABELS)
 )
 
@@ -118,13 +121,14 @@ def train_d3d(d3d_files):
     # ------------------------------------------------------------------
     print("\n=== DIII-D pipeline ===")
 
-    # include_thomson=False: raw per-channel Thomson expansion hits a real
-    # variable-channel-count issue across shots (44 vs 42 vs 54 core channels
-    # -- genuine hardware/config differences, not a bug) that breaks
-    # concatenation into one fixed-width feature matrix. See
-    # reports/team-log.md for the full story and why this was descoped
-    # rather than fixed with ad hoc padding. The raw-coil-only pipeline
-    # below is the one already validated at R2=0.995/SSIM=0.997.
+    # include_thomson=True: raw per-channel Thomson expansion used to break
+    # concatenation into one fixed-width feature matrix, since channel count
+    # varies shot-to-shot (44 vs 42 vs 54 core channels -- genuine hardware/
+    # config differences, not a bug). experiments.interpolate_thomson_to_efit
+    # now reduces each profile to shape-agnostic per-timestep stats (mean/std/
+    # max/min + electron pressure) instead of indexing channels by position,
+    # which is a fixed width regardless of channel count -- see its docstring.
+    # See reports/team-log.md for the original bug.
     #
     # One shot loaded (lean columns) at a time, immediately reduced to its
     # small feature/target slice -- see D3D_NEEDED_COLUMNS above for why.
@@ -133,7 +137,7 @@ def train_d3d(d3d_files):
     for i, f in enumerate(d3d_files):
         shot = load_shot_lean(f)
         shot["shot_index"] = i
-        Xi, Yi, Si, _ = build_feature_matrix([shot], include_thomson=False)
+        Xi, Yi, Si, _ = build_feature_matrix([shot], include_thomson=True)
         X_parts.append(Xi)
         Y_parts.append(Yi)
         S_parts.append(Si)

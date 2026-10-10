@@ -1,7 +1,8 @@
 """
 Train the PyTorch conv-decoder DIII-D flux-map model (scripts/torch_models.py) on
-raw coil + plasma-current features, direct-regressing the 65x65 psi grid (no PCA
-step -- see torch_models.py's docstring for why).
+raw coil + plasma-current features plus shape-agnostic Thomson scattering stats
+(see experiments.interpolate_thomson_to_efit), direct-regressing the 65x65 psi
+grid (no PCA step -- see torch_models.py's docstring for why).
 
 Loads local parquet shots the same way scripts/train_submission_models.py does
 (experiments.load_shot_from_hf_row + build_feature_matrix), splits by shot into
@@ -24,6 +25,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -40,23 +42,51 @@ D3D_LOCAL_DIR = REPO_ROOT / "hf_local_data" / "data" / "diii_d_train"
 MODELS_DIR = REPO_ROOT / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# Only the columns this pipeline (raw coils + plasma current, no Thomson) actually
-# reads -- parquet lets us skip the rest at the read() call, which matters a lot
-# here: each full row also carries Thomson_core/edge Te/ne/R and chord geometry
-# that this architecture never touches. Loading those anyway (as the generic
-# load_shot_from_hf_row does) roughly doubles per-shot memory for nothing, which
-# is what caused a real jetsam OOM kill at 1500 shots even though 900 shots fit
-# fine with the full-column loader in train_submission_models.py.
+# Only the columns this pipeline actually reads -- parquet lets us skip the
+# rest at the read() call, which matters a lot here: each full row also
+# carries Thomson chord-geometry and other columns this architecture never
+# touches. Loading those anyway (as the generic load_shot_from_hf_row does)
+# increases per-shot memory for nothing, which is part of what caused a real
+# jetsam OOM kill at 1500 shots even though 900 shots fit fine with the
+# full-column loader in train_submission_models.py.
 NEEDED_COLUMNS = (
     ["source", "efit_times", "efit_psirz", "magnetics_time", "magnetics_plasma_current_times"]
     + [f"magnetics_{sig}" for sig in D3D_MAGNETICS_SIGNALS]
+    + ["thomson_core_times", "thomson_core_Te", "thomson_core_ne",
+       "thomson_edge_times", "thomson_edge_Te", "thomson_edge_ne"]
     + list(EFIT_SCALAR_LABELS)
 )
 
 
+def boundary_weighted_mse(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3,
+                           max_weight: float = 15.0) -> torch.Tensor:
+    """MSE weighted toward low-|grad(psi)| regions. The magnetic axis (a local
+    extremum of psi) and, on diverted plasmas, the X-point (a saddle) both have
+    grad(psi) = 0 by definition -- and the scorer's Consistency term (R_axis,
+    kappa, LCFS shape, ...) is computed by re-locating exactly these features on
+    the PREDICTED flux map, not by scoring psi values directly. Plain per-pixel
+    MSE has no particular reason to protect accuracy at these points: they're a
+    handful of pixels out of 4225, easily outweighed by the bulk interior. This
+    directly targets the actual bottleneck -- Consistency stayed flat at ~0.91-
+    0.92 even after adding real new input data (Thomson scattering, more
+    shots), which only improved the scalar heads, not the hard-to-regress
+    critical points of the flux map itself.
+
+    Weight is computed from the TRUE psi (target), never the prediction, and
+    normalized to mean 1 per-frame so the loss stays on a comparable scale to
+    plain MSE (lr/scheduler behavior shouldn't need retuning)."""
+    gy = F.pad(target[:, 1:, :] - target[:, :-1, :], (0, 0, 0, 1))
+    gx = F.pad(target[:, :, 1:] - target[:, :, :-1], (0, 1, 0, 0))
+    grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-12)
+    weight = 1.0 / (grad_mag + eps)
+    weight = weight / weight.mean(dim=(1, 2), keepdim=True)
+    weight = weight.clamp(max=max_weight)
+    return (weight * (pred - target) ** 2).mean()
+
+
 def load_shot_lean(path: Path) -> dict:
     """Like load_shot_from_hf_row, but reads (and therefore loads into memory)
-    only NEEDED_COLUMNS -- no Thomson data -- since this pipeline is raw-coil-only."""
+    only NEEDED_COLUMNS."""
     row = pd.read_parquet(path, columns=NEEDED_COLUMNS).iloc[0]
     return load_shot_from_hf_row(row)
 
@@ -72,6 +102,10 @@ def main():
     parser.add_argument("--val-frac", type=float, default=0.1,
                          help="fraction of shots (not frames) held out for validation")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--loss", choices=["plain", "boundary"], default="boundary",
+                         help="plain MSE, or boundary_weighted_mse (up-weights low-gradient "
+                              "regions -- the magnetic axis / X-point -- where the scorer's "
+                              "Consistency term is most sensitive to small pixel errors)")
     args = parser.parse_args()
 
     d3d_files = sorted(D3D_LOCAL_DIR.glob("*.parquet"))
@@ -79,17 +113,21 @@ def main():
         d3d_files = d3d_files[:args.max_shots]
     print(f"Training on {len(d3d_files)} local DIII-D shots")
 
-    # Process one shot at a time (lean columns only, no Thomson) so at most one
-    # shot's raw+processed data is ever resident -- holding all N raw rows AND all
-    # N processed shot dicts simultaneously (the old approach) roughly doubled
+    # Process one shot at a time (lean columns only) so at most one shot's
+    # raw+processed data is ever resident -- holding all N raw rows AND all N
+    # processed shot dicts simultaneously (the old approach) roughly doubled
     # peak memory and caused a real jetsam OOM kill at 1500 shots.
     t0 = time.time()
     X_parts, Y_parts, S_parts, id_parts = [], [], [], []
     for i, f in enumerate(d3d_files):
         shot = load_shot_lean(f)
         shot["shot_index"] = i
-        Xi, Yi, Si, idi = build_feature_matrix([shot], include_thomson=False)
-        X_parts.append(Xi); Y_parts.append(Yi); S_parts.append(Si); id_parts.append(idi)
+        Xi, Yi, Si, idi = build_feature_matrix([shot], include_thomson=True)
+        # float16 immediately, per-shot -- not after concatenating every shot's
+        # frames into one array. At full dataset scale the concatenated float32
+        # Y is ~24GB on its own, before the train/val split's float16 cast (which
+        # only helped the ALREADY-concatenated array) ever gets a chance to run.
+        X_parts.append(Xi); Y_parts.append(Yi.astype(np.float16)); S_parts.append(Si); id_parts.append(idi)
         del shot
         if (i + 1) % 200 == 0:
             print(f"  loaded {i + 1}/{len(d3d_files)} shots ({time.time() - t0:.0f}s)")
@@ -152,7 +190,9 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
-    criterion = nn.MSELoss()
+    plain_mse = nn.MSELoss()
+    criterion = boundary_weighted_mse if args.loss == "boundary" else (lambda p, y: plain_mse(p, y))
+    print(f"  Loss: {args.loss}")
 
     best_val = float("inf")
     best_state = None

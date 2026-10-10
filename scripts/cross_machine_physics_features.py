@@ -145,11 +145,19 @@ FEATURE_NAMES = ["Ip", "TF_coil_proxy", "q_proxy_TF_over_Ip",
 def normalize_flux_per_frame(psirz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-frame z-score: removes absolute scale AND the DIII-D/MAST amplitude
     difference (dataset card: DIII-D median ~0.61 Wb/rad vs MAST ~0.21), so the
-    model learns shape, not magnitude."""
-    mean = psirz.reshape(len(psirz), -1).mean(axis=1)
-    std = psirz.reshape(len(psirz), -1).std(axis=1) + EPS
-    norm = (psirz - mean[:, None, None]) / std[:, None, None]
-    return norm.astype(np.float32), mean, std
+    model learns shape, not magnitude.
+
+    Mutates psirz in place and returns it, rather than allocating a separate
+    full-size output array -- at full dataset scale (65x65 x ~1M frames) that
+    doubling was large enough on its own to cause real memory exhaustion
+    (confirmed via a memory-sampling sidecar during training). No current
+    caller needs the pre-normalization values afterward."""
+    flat = psirz.reshape(len(psirz), -1)
+    mean = flat.mean(axis=1).astype(np.float32)
+    std = (flat.std(axis=1) + EPS).astype(np.float32)
+    psirz -= mean[:, None, None]
+    psirz /= std[:, None, None]
+    return psirz.astype(np.float32, copy=False), mean, std
 
 
 def best_sign_ssim(y_true: np.ndarray, y_pred: np.ndarray) -> float:
