@@ -85,24 +85,36 @@ from cross_machine_physics_features import build_physics_features  # noqa: E402
 # artifacts are present and it has been validated to beat the sklearn baseline
 # on scripts/leak_safe_score.py -- otherwise falls back to the sklearn path so
 # this script keeps working if torch isn't installed or hasn't been trained yet.
+_MODELS_DIR_EARLY = Path(__file__).resolve().parent / "models"
 try:
     import torch
     from torch_models import FluxDecoderNet, resolve_device
-    _D3D_TORCH_CKPT = Path(__file__).resolve().parent / "models" / "d3d_torch_model.pt"
+    _D3D_TORCH_CKPT = _MODELS_DIR_EARLY / "d3d_torch_model.pt"
+    # Seed-tagged checkpoints from scripts/train_torch_d3d.py --tag <name>, for
+    # D3D_PSI_MODE=torch_multi: training the GPU model is not bit-deterministic
+    # (observed composite-score swings of ~0.006 between identically-configured
+    # runs), so averaging several independent seeds gives a more reliable
+    # result than hoping any single run converges well.
+    _D3D_TORCH_MULTI_CKPTS = sorted(_MODELS_DIR_EARLY.glob("d3d_torch_model_*.pt"))
     _TORCH_OK = _D3D_TORCH_CKPT.exists()
 except ImportError:
     _TORCH_OK = False
+    _D3D_TORCH_MULTI_CKPTS = []
 
 # D3D_PSI_MODE picks which model produces the DIII-D psi prediction:
-#   "sklearn"  (default) -- StandardScaler -> PCA(50) -> MLPRegressor, the original baseline.
-#   "torch"    -- the conv-decoder (scripts/train_torch_d3d.py), direct pixel regression.
-#   "ensemble" -- mean of both psirz predictions.
+#   "sklearn"     (default) -- StandardScaler -> PCA(50) -> MLPRegressor, the original baseline.
+#   "torch"       -- the conv-decoder (scripts/train_torch_d3d.py), direct pixel regression.
+#   "torch_multi" -- mean of every d3d_torch_model_<tag>.pt found in models/ (multi-seed ensemble).
+#   "ensemble"    -- mean of sklearn and the single default torch checkpoint.
 # Opt-in via env var so the default submission path is untouched until a run has
 # actually been validated (scripts/leak_safe_score.py) to beat the baseline.
 D3D_PSI_MODE = os.environ.get("D3D_PSI_MODE", "sklearn")
 if D3D_PSI_MODE in ("torch", "ensemble") and not _TORCH_OK:
     raise RuntimeError(f"D3D_PSI_MODE={D3D_PSI_MODE!r} needs models/d3d_torch_model.pt "
                         "(run scripts/train_torch_d3d.py first) and torch installed.")
+if D3D_PSI_MODE == "torch_multi" and not _D3D_TORCH_MULTI_CKPTS:
+    raise RuntimeError("D3D_PSI_MODE='torch_multi' needs at least one models/d3d_torch_model_"
+                        "<tag>.pt (run scripts/train_torch_d3d.py --tag <name> per seed).")
 
 
 def _build_input_shot(row: dict) -> dict:
@@ -155,6 +167,21 @@ def _load_models() -> dict:
             net.eval().to(device)
             _models["d3d_torch_model"] = net
             _models["d3d_torch_device"] = device
+        if D3D_PSI_MODE == "torch_multi":
+            device = resolve_device()
+            ensemble = []
+            for model_path in _D3D_TORCH_MULTI_CKPTS:
+                tag = model_path.stem.removeprefix("d3d_torch_model_")
+                scaler_path = MODELS_DIR / f"d3d_torch_scaler_{tag}.joblib"
+                ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
+                net = FluxDecoderNet(n_features=ckpt["n_features"], base=ckpt["base"])
+                net.load_state_dict(ckpt["state_dict"])
+                net.eval().to(device)
+                ensemble.append((joblib.load(scaler_path), net))
+            _models["d3d_torch_ensemble"] = ensemble
+            _models["d3d_torch_device"] = device
+            print(f"  D3D_PSI_MODE=torch_multi: averaging {len(ensemble)} seed(s): "
+                  f"{[p.stem for p in _D3D_TORCH_MULTI_CKPTS]}")
     return _models
 
 
@@ -184,6 +211,15 @@ def _predict_d3d(row: dict) -> dict:
 
     if D3D_PSI_MODE == "ensemble":
         psirz = ((psirz_sklearn.astype(np.float32) + psirz_torch) / 2.0).astype(np.float32)
+    elif D3D_PSI_MODE == "torch_multi":
+        device = m["d3d_torch_device"]
+        preds = []
+        with torch.no_grad():
+            for seed_scaler, seed_net in m["d3d_torch_ensemble"]:
+                X_seed_scaled = seed_scaler.transform(X).astype(np.float32)
+                x_t = torch.from_numpy(X_seed_scaled).to(device)
+                preds.append(seed_net(x_t).cpu().numpy().astype(np.float32))
+        psirz = np.mean(preds, axis=0).astype(np.float32)
     else:
         psirz = psirz_torch if D3D_PSI_MODE == "torch" else psirz_sklearn
 

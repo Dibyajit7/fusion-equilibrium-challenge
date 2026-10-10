@@ -102,11 +102,17 @@ def main():
     parser.add_argument("--val-frac", type=float, default=0.1,
                          help="fraction of shots (not frames) held out for validation")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--loss", choices=["plain", "boundary"], default="boundary",
-                         help="plain MSE, or boundary_weighted_mse (up-weights low-gradient "
-                              "regions -- the magnetic axis / X-point -- where the scorer's "
-                              "Consistency term is most sensitive to small pixel errors)")
+    parser.add_argument("--loss", choices=["plain", "boundary"], default="plain",
+                         help="plain MSE (default -- boundary_weighted_mse tested worse in a "
+                              "matched A/B, see git history), or boundary_weighted_mse "
+                              "(up-weights low-gradient regions -- the magnetic axis / X-point "
+                              "-- where the scorer's Consistency term is most sensitive)")
+    parser.add_argument("--tag", default="",
+                         help="suffix for output filenames (d3d_torch_model_<tag>.pt etc) -- "
+                              "set this when training multiple seeds for an ensemble, so each "
+                              "run doesn't overwrite the last one")
     args = parser.parse_args()
+    suffix = f"_{args.tag}" if args.tag else ""
 
     d3d_files = sorted(D3D_LOCAL_DIR.glob("*.parquet"))
     if args.max_shots:
@@ -249,12 +255,14 @@ def main():
     model.load_state_dict(best_state)
     model.eval()
 
-    joblib.dump(scaler, MODELS_DIR / "d3d_torch_scaler.joblib")
+    scaler_name = f"d3d_torch_scaler{suffix}.joblib"
+    model_name = f"d3d_torch_model{suffix}.pt"
+    joblib.dump(scaler, MODELS_DIR / scaler_name)
     torch.save(
         {"state_dict": model.state_dict(), "n_features": n_features, "base": args.base_channels},
-        MODELS_DIR / "d3d_torch_model.pt",
+        MODELS_DIR / model_name,
     )
-    print(f"\nSaved d3d_torch_scaler.joblib and d3d_torch_model.pt to {MODELS_DIR}")
+    print(f"\nSaved {scaler_name} and {model_name} to {MODELS_DIR}")
     print(f"Best val MSE: {best_val:.6f}")
 
 
