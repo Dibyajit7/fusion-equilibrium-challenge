@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -82,6 +83,35 @@ D3D_NEEDED_COLUMNS = (
 def load_shot_lean(path: Path) -> dict:
     row = pd.read_parquet(path, columns=D3D_NEEDED_COLUMNS).iloc[0]
     return load_shot_from_hf_row(row)
+
+
+class Heartbeat:
+    """Prints a progress line every `interval` seconds while a silent,
+    long-running call (e.g. sklearn's PCA/MLP fit on ~1M rows) executes.
+    Background jobs in this environment have repeatedly died, with no memory
+    pressure, at the exact point a long silent fit() call starts -- consistent
+    with an idle-output watchdog killing a task that goes quiet too long.
+    Wrap any call that might run for more than ~30s with no output of its own."""
+
+    def __init__(self, label: str, interval: float = 15.0):
+        self.label = label
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        def _beat():
+            n = 0
+            while not self._stop.wait(self.interval):
+                n += 1
+                print(f"    ...{self.label} still running ({n * self.interval:.0f}s)", flush=True)
+        self._thread = threading.Thread(target=_beat, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
 
 
 def fit_scalar_model(X: np.ndarray, y: np.ndarray) -> MLPRegressor:
@@ -153,16 +183,33 @@ def train_d3d(d3d_files):
     scaler = StandardScaler().fit(X)
     X_scaled = scaler.transform(X)
 
-    pca = TargetPCA(n_components=50).fit(Y)
+    # psi uses magnetics only, not the full (magnetics + Thomson) feature set:
+    # adding Thomson's 20 extra columns measurably hurt this specific head
+    # (Consistency dropped from ~0.92 to ~0.71 in a same-shots-count A/B test)
+    # even though the SAME features clearly helped q95/betaN below. Likely an
+    # under-capacity issue (same MLP size, more input dims to fit), not a sign
+    # Thomson is uninformative for psi -- but fixing capacity is unexplored, so
+    # for now just don't regress a head that was already working. Magnetics
+    # columns are always first in build_feature_matrix's hstack order.
+    n_mag = len(D3D_MAGNETICS_SIGNALS)
+    X_psi_scaled = X_scaled[:, :n_mag]
+
+    print("  fitting PCA(50)...")
+    with Heartbeat("PCA(50) fit"):
+        pca = TargetPCA(n_components=50).fit(Y)
     print(f"  PCA(50): {np.cumsum(pca.explained_variance_ratio)[-1] * 100:.2f}% variance")
 
+    print("  fitting psi_model...")
     psi_model = MLPRegressor(hidden_layer_sizes=(256, 128), max_iter=500,
                               early_stopping=True, random_state=42)
-    psi_model.fit(X_scaled, pca.transform(Y))
+    with Heartbeat("psi_model fit"):
+        psi_model.fit(X_psi_scaled, pca.transform(Y))
     print("  psi_model trained")
 
-    q95_model = fit_scalar_model(X_scaled, S[:, Q95_IDX])
-    betaN_model = fit_scalar_model(X_scaled, S[:, BETAN_IDX])
+    print("  fitting q95_model, betaN_model...")
+    with Heartbeat("q95/betaN fit"):
+        q95_model = fit_scalar_model(X_scaled, S[:, Q95_IDX])
+        betaN_model = fit_scalar_model(X_scaled, S[:, BETAN_IDX])
     print("  q95_model, betaN_model trained")
 
     joblib.dump(scaler, MODELS_DIR / "d3d_scaler.joblib")
@@ -205,10 +252,14 @@ def train_mast(d3d_files):
     physics_scaler = StandardScaler().fit(Xp)
     Xp_scaled = physics_scaler.transform(Xp)
 
-    physics_pca = TargetPCA(n_components=30).fit(Yp_norm)
+    print("  fitting physics PCA(30)...")
+    with Heartbeat("physics PCA(30) fit"):
+        physics_pca = TargetPCA(n_components=30).fit(Yp_norm)
     physics_psi_model = MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=500,
                                       early_stopping=True, random_state=42)
-    physics_psi_model.fit(Xp_scaled, physics_pca.transform(Yp_norm))
+    print("  fitting physics_psi_model...")
+    with Heartbeat("physics_psi_model fit"):
+        physics_psi_model.fit(Xp_scaled, physics_pca.transform(Yp_norm))
     print("  physics_psi_model trained (predicts normalized shape)")
 
     # Scalars via the same physics features, so they're computable on MAST too
@@ -225,8 +276,10 @@ def train_mast(d3d_files):
                 S_phys[offset:offset + m, j] = arr[:m]
         offset += n
 
-    physics_q95_model = fit_scalar_model(Xp_scaled, S_phys[:, 0])
-    physics_betaN_model = fit_scalar_model(Xp_scaled, S_phys[:, 1])
+    print("  fitting physics q95/betaN models...")
+    with Heartbeat("physics q95/betaN fit"):
+        physics_q95_model = fit_scalar_model(Xp_scaled, S_phys[:, 0])
+        physics_betaN_model = fit_scalar_model(Xp_scaled, S_phys[:, 1])
     print("  physics_q95_model, physics_betaN_model trained")
 
     joblib.dump(physics_scaler, MODELS_DIR / "physics_scaler.joblib")

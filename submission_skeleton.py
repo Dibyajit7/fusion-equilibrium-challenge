@@ -102,18 +102,19 @@ except ImportError:
     _D3D_TORCH_MULTI_CKPTS = []
 
 # D3D_PSI_MODE picks which model produces the DIII-D psi prediction:
-#   "sklearn"     (default) -- StandardScaler -> PCA(50) -> MLPRegressor, the original baseline.
-#   "torch"       -- the conv-decoder (scripts/train_torch_d3d.py), direct pixel regression.
-#   "torch_multi" -- mean of every d3d_torch_model_<tag>.pt found in models/ (multi-seed ensemble).
-#   "ensemble"    -- mean of sklearn and the single default torch checkpoint.
+#   "sklearn"       (default) -- StandardScaler -> PCA(50) -> MLPRegressor, the original baseline.
+#   "torch"         -- the conv-decoder (scripts/train_torch_d3d.py), direct pixel regression.
+#   "torch_multi"   -- mean of every d3d_torch_model_<tag>.pt found in models/ (multi-seed ensemble).
+#   "ensemble"      -- mean of sklearn and the single default torch checkpoint.
+#   "ensemble_multi" -- mean of sklearn and the full torch_multi seed average.
 # Opt-in via env var so the default submission path is untouched until a run has
 # actually been validated (scripts/leak_safe_score.py) to beat the baseline.
 D3D_PSI_MODE = os.environ.get("D3D_PSI_MODE", "sklearn")
 if D3D_PSI_MODE in ("torch", "ensemble") and not _TORCH_OK:
     raise RuntimeError(f"D3D_PSI_MODE={D3D_PSI_MODE!r} needs models/d3d_torch_model.pt "
                         "(run scripts/train_torch_d3d.py first) and torch installed.")
-if D3D_PSI_MODE == "torch_multi" and not _D3D_TORCH_MULTI_CKPTS:
-    raise RuntimeError("D3D_PSI_MODE='torch_multi' needs at least one models/d3d_torch_model_"
+if D3D_PSI_MODE in ("torch_multi", "ensemble_multi") and not _D3D_TORCH_MULTI_CKPTS:
+    raise RuntimeError(f"D3D_PSI_MODE={D3D_PSI_MODE!r} needs at least one models/d3d_torch_model_"
                         "<tag>.pt (run scripts/train_torch_d3d.py --tag <name> per seed).")
 
 
@@ -167,7 +168,7 @@ def _load_models() -> dict:
             net.eval().to(device)
             _models["d3d_torch_model"] = net
             _models["d3d_torch_device"] = device
-        if D3D_PSI_MODE == "torch_multi":
+        if D3D_PSI_MODE in ("torch_multi", "ensemble_multi"):
             device = resolve_device()
             ensemble = []
             for model_path in _D3D_TORCH_MULTI_CKPTS:
@@ -200,18 +201,19 @@ def _predict_d3d(row: dict) -> dict:
 
     psirz_sklearn = None
     psirz_torch = None
-    if D3D_PSI_MODE in ("sklearn", "ensemble"):
-        psirz_sklearn = m["d3d_pca"].inverse_transform(m["d3d_psi_model"].predict(X_scaled))
+    psirz_torch_multi = None
+    if D3D_PSI_MODE in ("sklearn", "ensemble", "ensemble_multi"):
+        # psi was trained on magnetics-only columns (see train_submission_models.py's
+        # train_d3d for why) -- Thomson stays in X_scaled for q95/betaN above.
+        X_psi_scaled = X_scaled[:, :len(D3D_MAGNETICS_SIGNALS)]
+        psirz_sklearn = m["d3d_pca"].inverse_transform(m["d3d_psi_model"].predict(X_psi_scaled))
     if D3D_PSI_MODE in ("torch", "ensemble"):
         X_torch_scaled = m["d3d_torch_scaler"].transform(X).astype(np.float32)
         device = m["d3d_torch_device"]
         with torch.no_grad():
             x_t = torch.from_numpy(X_torch_scaled).to(device)
             psirz_torch = m["d3d_torch_model"](x_t).cpu().numpy().astype(np.float32)
-
-    if D3D_PSI_MODE == "ensemble":
-        psirz = ((psirz_sklearn.astype(np.float32) + psirz_torch) / 2.0).astype(np.float32)
-    elif D3D_PSI_MODE == "torch_multi":
+    if D3D_PSI_MODE in ("torch_multi", "ensemble_multi"):
         device = m["d3d_torch_device"]
         preds = []
         with torch.no_grad():
@@ -219,7 +221,14 @@ def _predict_d3d(row: dict) -> dict:
                 X_seed_scaled = seed_scaler.transform(X).astype(np.float32)
                 x_t = torch.from_numpy(X_seed_scaled).to(device)
                 preds.append(seed_net(x_t).cpu().numpy().astype(np.float32))
-        psirz = np.mean(preds, axis=0).astype(np.float32)
+        psirz_torch_multi = np.mean(preds, axis=0).astype(np.float32)
+
+    if D3D_PSI_MODE == "ensemble":
+        psirz = ((psirz_sklearn.astype(np.float32) + psirz_torch) / 2.0).astype(np.float32)
+    elif D3D_PSI_MODE == "ensemble_multi":
+        psirz = ((psirz_sklearn.astype(np.float32) + psirz_torch_multi) / 2.0).astype(np.float32)
+    elif D3D_PSI_MODE == "torch_multi":
+        psirz = psirz_torch_multi
     else:
         psirz = psirz_torch if D3D_PSI_MODE == "torch" else psirz_sklearn
 
