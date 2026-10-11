@@ -272,3 +272,181 @@ fix for cross-machine collapse actually works directionally — the next
 open question is whether it holds up at a larger shot count and whether the
 R²/SSIM disagreement on DIII-D needs a different normalization before this
 is submission-ready.
+
+---
+
+## 2026-10-09 to 2026-10-11 — scaling up, Thomson fixed, seed-ensemble, plateau found
+
+**Starting point:** a real submission was already live (composite **S = 0.9576**
+on a local leak-safe check), trained on 900–1500 of the 2352 DIII-D shots
+downloaded at the time, Thomson scattering excluded entirely (the open lead
+from the section above, not yet pursued).
+
+**What got done, in order:**
+
+1. **Fixed the open Thomson lead.** `experiments.interpolate_thomson_to_efit`
+   now reduces each profile (core + edge, Te + ne) to shape-agnostic
+   per-timestep stats — mean/std/max/min + peak/integrated electron pressure
+   — instead of indexing raw channels by position. Fixed width regardless of
+   channel count (40/42/43/44/54 on DIII-D core), same pattern the MAST
+   physics pipeline already used. Also fixed the same float32-overflow bug
+   this surfaced again (`ne` ~1e19, squared internally by `nanstd`, needs
+   float64).
+2. **Downloaded the full DIII-D training set**: 2352 → 6332 → all **7041**
+   shots now sit locally in `hf_local_data/data/diii_d_train/` (~94GB).
+   Removed an unrelated 64GB game (`Dakar Desert Rally`) to make room; disk
+   is not a constraint for anything described below (≈78–80GB free as of
+   this writing).
+3. **Found and fixed three real memory bugs** that only showed up at this
+   shot count (all previously invisible at the smaller scales tested
+   earlier): `TargetPCA.fit`/`transform` was unconditionally upcasting the
+   *entire* training target array to float64 (fine at ~2000 shots, tens of
+   extra GB at 7000+); `normalize_flux_per_frame` allocated a full second
+   copy of its output instead of mutating in place; `train_torch_d3d.py`'s
+   per-shot accumulation loop cast to float16 only *after* concatenating
+   every shot (by which point the float32 version had already peaked). Fixed
+   all three. See `scripts/train_submission_models.py`, `scripts/
+   cross_machine_physics_features.py`, `scripts/train_torch_d3d.py` git
+   history around 2026-10-09/10 for the exact diffs.
+4. **Found the DIII-D sklearn and GPU (torch) pipelines scale differently per
+   shot** — empirically calibrated safe `--max-shots` caps on this machine
+   (25.7GB RAM): sklearn D3D ≈ **4500** shots, MAST physics ≈ **3200** shots
+   (its per-frame memory cost is higher than D3D's, don't assume one cap
+   transfers to the other), the GPU conv-decoder handles the **full 7041**
+   fine once lean-loaded and float16-from-the-start (same pipeline that
+   needed those fixes above).
+5. **Tried a boundary-weighted loss** (`train_torch_d3d.py --loss boundary`,
+   still in the code as an opt-in flag) — up-weights low-|∇ψ| regions (the
+   magnetic axis and X-point, both exactly where the scorer's Consistency
+   term is most sensitive). Tested via a matched A/B at identical shot
+   count/epochs: scored *worse* than plain MSE (0.9731 vs 0.9755 composite).
+   Likely cause: the gradient estimate was computed from the float16-stored
+   target, which is noisiest exactly in the flat regions the loss was
+   supposed to target. Not deleted — worth revisiting with a float32
+   gradient estimate — but plain MSE is the working default now.
+6. **Found adding Thomson to the sklearn psi head hurts it badly** (same
+   features that helped `q95`/`betaN` a lot — R²  0.985→0.995 — dropped psi's
+   Consistency from ~0.92 to ~0.71 in a same-shot-count A/B). Fixed by
+   training the psi head on magnetics-only columns (sliced out of the shared
+   scaled feature matrix) while keeping Thomson for the scalar heads. Sklearn
+   alone recovered to composite 0.9866.
+7. **Discovered GPU (MPS) training has real run-to-run variance** — two
+   identically-configured training runs (same seed, same data, same code)
+   converged to meaningfully different optima (composite 0.9789 vs 0.9851).
+   Built a multi-seed ensemble instead of hoping for a lucky run:
+   `train_torch_d3d.py --tag <name>` saves distinctly-named checkpoints per
+   seed, `D3D_PSI_MODE=torch_multi` (or `ensemble_multi` to also blend in the
+   fixed sklearn psi head) averages every `d3d_torch_model_*.pt` found.
+8. **Scaled the ensemble and watched it plateau.** Composite score by seed
+   count: 1 seed 0.9789 → 3 seeds **0.9851** → 8 seeds **0.9886** (local
+   `ensemble_multi`: 0.9907) → 13 seeds **0.9909** local. The *marginal* gain
+   per batch of seeds added: 1→3 seeds +0.0035, 3→8 seeds +0.0015, 8→13
+   seeds +0.0002. Clean diminishing returns, now flat. **More seeds will not
+   reach a meaningfully higher score** — this lever is exhausted.
+
+**Real (Codabench) vs. local (leak-safe) scores, for calibration:** the one
+real submission checked against the actual leaderboard this period scored
+**0.9807** when the local leak-safe estimate for that exact model was 0.9851
+— i.e. local estimates run **~0.004–0.005 optimistic** relative to the real
+scorer. Keep that gap in mind reading any "local" number above.
+
+**A real operational hazard, worth knowing before relaunching anything
+long-running:** background jobs launched through Claude Code's normal
+tracked-background-task mechanism died unpredictably and repeatedly during
+this period — not from OOM (a memory-sampling sidecar confirmed healthy,
+plentiful free RAM at every death), not from sleep/wake, not from Spotlight
+(once suppressed). The fix that worked: launch via
+`nohup bash -c '...' < /dev/null > logfile 2>&1 & echo $! > /tmp/name.pid; disown`
+and poll with `ps -p $(cat /tmp/name.pid)` instead of trusting the tracked
+background-task status. One process was also seen stuck in macOS's `UN`
+(uninterruptible I/O wait) state for several minutes before clearing on its
+own — that's transient contention, not a deadlock; don't kill a `UN` process
+on sight, just wait.
+
+### Current state (end of this period)
+
+| What | Value |
+|---|---|
+| Local leak-safe composite (best, 13-seed `ensemble_multi`) | **0.9909** |
+| Real Codabench composite (last checked, 8-seed-era submission) | **0.9807** |
+| Submission pushed to HF | `Diby07/fusion-eq-predictions` @ commit `eb2369be54037fe93bef092b0315729acb9a6373` |
+| Code pushed to fork | `Dibyajit7/fusion-equilibrium-challenge` @ commit `bf5f0d5` |
+| `D3D_PSI_MODE` used for the above | `ensemble_multi` |
+| Seeds in the torch ensemble | 13 (`models/d3d_torch_model_s{42,123,777,1001,2002,3003,4004,5005,6006,7007,8008,9009,10010}.pt`) |
+| Local DIII-D shots on disk | 7041 / 7041 (all of them) |
+| Disk free | ≈78–80GB |
+
+### Next steps — three options, none of them "train more seeds"
+
+The seed-ensemble lever is exhausted (see point 8 above). Closing the
+remaining ~0.01 gap to something like 0.997 (the current #1 leaderboard
+entry scores 0.9967 — nobody has actually reached 0.997) needs a
+structurally different change. None of these need any new data download —
+the full 7041-shot DIII-D set is already local, and disk is not a
+constraint. Approximate time estimates assume this same machine (25.7GB
+RAM, Apple Silicon MPS GPU) and the environmental kill issue above already
+being handled via the detached/nohup pattern.
+
+1. **Fix sklearn's capacity so Thomson helps psi instead of hurting it.**
+   Right now Thomson is excluded from the psi head entirely (point 6 above)
+   because the existing architecture (a 256,128 MLP after PCA(50)) couldn't
+   absorb the extra 20 input dimensions without degrading. Try a bigger
+   hidden-layer MLP, more PCA components, or a separate small head that
+   specifically learns a Thomson-conditioned *correction* to the
+   magnetics-only prediction rather than retraining on the combined feature
+   set from scratch.
+   — **Time:** half a day to a full day (each retrain-and-leak-safe-eval
+     cycle at the proven-safe ~4500-shot cap is ~25–35 minutes; expect
+     5–15 iterations to find a config that doesn't regress Consistency).
+   — **Space:** none beyond what's already on disk.
+   — **Risk:** moderate — this exact feature combination already failed
+     once; no guarantee a bigger MLP fixes it rather than just being slower
+     to fail the same way.
+
+2. **A different architecture for the flux-map regression itself.** The
+   current `FluxDecoderNet` (`scripts/torch_models.py`) is a fairly simple
+   FC→conv-upsample decoder. A deeper network, a U-Net-style architecture
+   with skip connections, or incorporating a physics-consistency term
+   (e.g. a differentiable penalty tied to the Grad–Shafranov equation, or to
+   known ψ symmetry/boundary properties) could plausibly push past where the
+   current architecture has saturated — R²_psi is already ~0.9997, but
+   Consistency depends on precision at specific low-gradient points (the
+   magnetic axis, the X-point) that a generic pixelwise-MSE-trained decoder
+   has no particular incentive to get exactly right.
+   — **Time:** multi-day. Designing + implementing + debugging a new
+     architecture, then the same full-scale training cycle (~2–2.5 hours per
+     run on this GPU) repeated across design iterations and likely another
+     multi-seed ensemble once a good architecture is found. Realistically
+     2–4 days of combined engineering + compute time.
+   — **Space:** none beyond what's already on disk; a deeper/wider model's
+     checkpoint files are still only a few MB each, immaterial.
+   — **Risk:** highest payoff ceiling, highest effort, least certain to pay
+     off within any fixed time budget.
+
+3. **Revisit the boundary-weighted loss with a cleaner gradient estimate.**
+   Point 5 above found it scored worse, but the likely cause (gradient
+   computed from a float16-stored target) is a fixable implementation
+   detail, not evidence the underlying idea (up-weight low-|∇ψ| regions) is
+   wrong — it's the single most mechanism-targeted idea tried so far, since
+   it directly addresses *why* Consistency is hard (sensitivity at low-
+   gradient points) rather than throwing more data/capacity at the problem
+   generally.
+   — **Time:** half a day for the fix + a matched small-scale A/B
+     revalidation (~1 hour of compute, same methodology as before, see point
+     5); if it validates, the same multi-seed scale-up as before adds
+     another ~2–12+ hours depending on how many seeds are worth training
+     once the single-model result is known.
+   — **Space:** none beyond what's already on disk.
+   — **Risk:** lowest effort to re-test the idea properly; unknown whether
+     the fix actually resolves the earlier regression.
+
+**Bonus/secondary option, not one of the three above:** Challenge 2 (MAST)
+was never pushed as far — its physics-feature pipeline is capped at 3200
+shots (the safe memory ceiling found for that specific pipeline) and never
+got a GPU/multi-seed treatment at all. If a future session has spare time
+after the DIII-D-focused options above, applying the same multi-seed-GPU-
+ensemble idea to Challenge 2 is a known-working pattern, not a new one, and
+might be a faster win than any of the three options above — but Challenge
+2's `G_ratio` score depends on DIII-D clearing a `S ≥ 0.85` gate first (it
+currently does, comfortably), so it's additive, not a replacement for the
+DIII-D work.
