@@ -344,11 +344,22 @@ from the section above, not yet pursued).
    seeds +0.0002. Clean diminishing returns, now flat. **More seeds will not
    reach a meaningfully higher score** — this lever is exhausted.
 
-**Real (Codabench) vs. local (leak-safe) scores, for calibration:** the one
-real submission checked against the actual leaderboard this period scored
-**0.9807** when the local leak-safe estimate for that exact model was 0.9851
-— i.e. local estimates run **~0.004–0.005 optimistic** relative to the real
-scorer. Keep that gap in mind reading any "local" number above.
+**Real (Codabench) vs. local (leak-safe) scores, for calibration:** two real
+submissions were checked against the actual leaderboard this period:
+
+| Local (leak-safe, n=50) | Real (Codabench) | Gap |
+|---|---|---|
+| 0.9851 | 0.9807 | −0.0044 |
+| 0.9909 (13-seed, final) | **0.9866** | −0.0043 |
+
+That's a consistent **−0.0043/−0.0044 offset**, not noise — local leak-safe
+estimates reliably run about this much optimistic relative to the real
+scorer. This matters for the 0.997 target: getting there for real would need
+the *local* estimate to reach roughly **0.999** — essentially a
+simultaneously near-perfect R²_psi, R²_scalars, D_LCFS, and Consistency, not
+an incremental improvement on any one of them. Treat 0.997 as a long-shot
+ceiling, not a near-term target, when deciding whether any of the three
+options below are worth pursuing.
 
 **A real operational hazard, worth knowing before relaunching anything
 long-running:** background jobs launched through Claude Code's normal
@@ -368,7 +379,7 @@ on sight, just wait.
 | What | Value |
 |---|---|
 | Local leak-safe composite (best, 13-seed `ensemble_multi`) | **0.9909** |
-| Real Codabench composite (last checked, 8-seed-era submission) | **0.9807** |
+| Real Codabench composite (13-seed `ensemble_multi`, final submission) | **0.9866** |
 | Submission pushed to HF | `Diby07/fusion-eq-predictions` @ commit `eb2369be54037fe93bef092b0315729acb9a6373` |
 | Code pushed to fork | `Dibyajit7/fusion-equilibrium-challenge` @ commit `bf5f0d5` |
 | `D3D_PSI_MODE` used for the above | `ensemble_multi` |
